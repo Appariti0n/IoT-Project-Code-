@@ -1,0 +1,401 @@
+  ----------  Wokwi sim: https://wokwi.com/projects/434415193355703297   -----------
+
+  ----------  diagram.json is bellow  ----------
+
+Code:
+
+
+#include <WiFi.h>
+#include "Adafruit_MQTT.h"
+#include "Adafruit_MQTT_Client.h"
+#include <EEPROM.h>
+#include <DHT.h>
+#include <LiquidCrystal.h>
+
+#define WIFI_SSID       "Wokwi-GUEST"
+#define WIFI_PASSWORD   ""
+#define WIFI_CHANNEL    6
+
+#define AIO_SERVER      "io.adafruit.com"
+#define AIO_SERVERPORT  1883
+#define AIO_USERNAME    "username" 
+#define AIO_KEY         "key" 
+
+#define TEMP_HIGH_ALARM 29.0
+#define TEMP_LOW_ALARM  10.0
+#define HUM_HIGH_ALARM  70.0
+#define HUM_LOW_ALARM   40.0
+
+// --- Demo Mode config to show variation of data ---
+#define DEMO_DURATION_MS 30000 
+
+// --- Hardware Pinout ---
+#define LCD_RS 23
+#define LCD_E  22
+#define LCD_D4 21
+#define LCD_D5 19
+#define LCD_D6 18
+#define LCD_D7 17
+#define DHTPIN 16
+#define DHTTYPE DHT22
+#define GAS_PIN 34
+#define TRIG_PIN 32
+#define ECHO_PIN 33
+#define PUMP_RELAY_PIN 25
+#define SET_BUTTON_PIN 27
+#define MODE_SWITCH_PIN 26
+#define ALARM_LED_PIN 13
+#define ALARM_BUZZER_PIN 12
+
+
+WiFiClient client;
+Adafruit_MQTT_Client mqtt(&client, AIO_SERVER, AIO_SERVERPORT, AIO_USERNAME, AIO_KEY);
+LiquidCrystal lcd(LCD_RS, LCD_E, LCD_D4, LCD_D5, LCD_D6, LCD_D7);
+DHT dht(DHTPIN, DHTTYPE);
+
+Adafruit_MQTT_Publish waterLevelFeed = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/water-level");
+Adafruit_MQTT_Publish tempFeed = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/temperature");
+Adafruit_MQTT_Publish humidityFeed = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/humidity");
+Adafruit_MQTT_Publish pumpStatusFeed = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/pump-status");
+Adafruit_MQTT_Publish gasLevelFeed = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/gas-level");
+Adafruit_MQTT_Publish alarmStatusFeed = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/alarm-status");
+
+long duration, inches;
+int set_val, percentage;
+bool state = false, pump = false, alarmState = false;
+float hum, temp;
+int gasValue;
+unsigned long lastMqttPublish = 0;
+bool demo_message_shown = false;
+
+void MQTT_connect();
+void checkAlarms();
+
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  Serial.println(" System Loading ");
+
+  // Initialize hardware pins
+  pinMode(GAS_PIN, INPUT);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(SET_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(MODE_SWITCH_PIN, INPUT_PULLUP);
+  pinMode(PUMP_RELAY_PIN, OUTPUT);
+  pinMode(ALARM_LED_PIN, OUTPUT);
+  pinMode(ALARM_BUZZER_PIN, OUTPUT);
+  digitalWrite(PUMP_RELAY_PIN, !pump);
+  digitalWrite(ALARM_LED_PIN, LOW);
+  digitalWrite(ALARM_BUZZER_PIN, LOW);
+
+  dht.begin();
+  EEPROM.begin(4);
+  lcd.begin(16, 2);
+  lcd.print("Connecting WiFi");
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD, WIFI_CHANNEL);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected");
+
+  EEPROM.get(0, set_val);
+  if (set_val <= 0 || set_val > 1000) set_val = 150;
+  
+  lcd.clear();
+  lcd.print("WATER LEVEL:");
+  lcd.setCursor(0, 1);
+  lcd.print("PUMP:OFF MANUAL");
+  Serial.println("Setup Complete. Project Running. ");
+  Serial.print("Full Demo will run for ");
+  Serial.print(DEMO_DURATION_MS / 1000);
+  Serial.println(" seconds. ---");
+}
+
+void loop() {
+  MQTT_connect();
+
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  duration = pulseIn(ECHO_PIN, HIGH, 1000000);
+  if (duration > 0) {
+    inches = microsecondsToInches(duration);
+    if (set_val > 0) percentage = map(inches, set_val, 0, 0, 100);
+    else percentage = 0;
+  }
+  if (percentage < 0) percentage = 0;
+  if (percentage > 100) percentage = 100;
+  lcd.setCursor(12, 0);
+  lcd.print(percentage);
+  lcd.print("%   ");
+  bool isAutoMode = digitalRead(MODE_SWITCH_PIN);
+  if (isAutoMode) {
+    if (percentage < 30) pump = true;
+    if (percentage > 99) pump = false;
+  }
+  if (!digitalRead(SET_BUTTON_PIN) && !state) {
+    state = true;
+    if (isAutoMode) {
+      set_val = inches;
+      EEPROM.put(0, set_val);
+      EEPROM.commit();
+      lcd.setCursor(0,0);
+      lcd.print("SET POINT SAVED!");
+      delay(1000);
+      lcd.print("WATER LEVEL:   ");
+    } else {
+      pump = !pump;
+    }
+  }
+  if (digitalRead(SET_BUTTON_PIN)) state = false;
+  digitalWrite(PUMP_RELAY_PIN, !pump);
+  lcd.setCursor(5, 1);
+  lcd.print(pump ? "ON " : "OFF");
+  lcd.setCursor(9, 1);
+  lcd.print(isAutoMode ? "AUTO    " : "MANUAL");
+
+  if (millis() - lastMqttPublish > 15000) {
+    
+    if (millis() < DEMO_DURATION_MS) {
+      unsigned long demo_time = millis();
+      unsigned long half_demo = DEMO_DURATION_MS / 2;
+      
+      Serial.println("Demo Mode Active");
+
+      if (demo_time < half_demo) {
+        temp = 15.0 + (30.0 * demo_time / half_demo); 
+      } else {
+        temp = 45.0 - (30.0 * (demo_time - half_demo) / half_demo);
+      }
+      
+      gasValue = 1800; 
+      
+      hum = 55.0; 
+      Serial.print("Demo Temp: "); Serial.print(temp);
+      Serial.print(" | Demo Gas: "); Serial.println(gasValue);
+      demo_message_shown = false;
+
+    } else {
+      // After demo is over, use real sensor data
+      if (!demo_message_shown) {
+        Serial.println("Demo Ended. Using real sensor data. ");
+        demo_message_shown = true;
+      }
+      hum = dht.readHumidity();
+      temp = dht.readTemperature();
+      gasValue = analogRead(GAS_PIN);
+    }
+
+    
+    checkAlarms();
+
+    if (!isnan(hum) && !isnan(temp)) {
+      Serial.print("Sending data to Adafruit IO...");
+      
+      waterLevelFeed.publish((int32_t)percentage);
+      tempFeed.publish(temp);
+      humidityFeed.publish(hum);
+      gasLevelFeed.publish((int32_t)gasValue);
+      pumpStatusFeed.publish((int32_t)pump);
+      alarmStatusFeed.publish((int32_t)alarmState);
+
+      Serial.println(" OK!");
+    } else {
+      Serial.println("Failed to read from DHT sensor. Not publishing.");
+    }
+    lastMqttPublish = millis();
+  }
+
+  if (alarmState) {
+    digitalWrite(ALARM_BUZZER_PIN, HIGH);
+    delay(100);
+    digitalWrite(ALARM_BUZZER_PIN, LOW);
+  }
+
+  delay(200); 
+}
+
+void checkAlarms() {
+  if (isnan(hum) || isnan(temp)) {
+    return;
+  }
+  if (temp > TEMP_HIGH_ALARM || temp < TEMP_LOW_ALARM || hum > HUM_HIGH_ALARM || hum < HUM_LOW_ALARM) {
+    if (!alarmState) {
+        Serial.println("Alarm Triggered! Temp/Humidity is out of range.");
+    }
+    alarmState = true;
+    digitalWrite(ALARM_LED_PIN, HIGH);
+  } else {
+    if (alarmState) {
+        Serial.println("Alarm condition cleared.");
+    }
+    alarmState = false;
+    digitalWrite(ALARM_LED_PIN, LOW);
+    digitalWrite(ALARM_BUZZER_PIN, LOW);
+  }
+}
+
+long microsecondsToInches(long microseconds) {
+  return microseconds / 74 / 2;
+}
+
+void MQTT_connect() {
+  int8_t ret;
+  if (mqtt.connected()) {
+    return;
+  }
+  Serial.print("Connecting to MQTT... ");
+  uint8_t retries = 3;
+  while ((ret = mqtt.connect()) != 0) {
+    Serial.println(mqtt.connectErrorString(ret));
+    Serial.println("Retrying MQTT connection in 5 seconds...");
+    mqtt.disconnect();
+    delay(5000);
+    retries--;
+    if (retries == 0) {
+      while (1);
+    }
+  }
+  Serial.println("MQTT Connected!");
+}
+
+
+
+
+
+
+
+
+      ------------     diagram.json:     ------------
+
+
+
+
+{
+  "version": 1,
+  "author": "wokwi",
+  "editor": "wokwi",
+  "parts": [
+    {
+      "type": "board-esp32-devkit-c-v4",
+      "id": "esp",
+      "top": 142.34,
+      "left": -505.1,
+      "rotate": 90,
+      "attrs": {}
+    },
+    { "type": "wokwi-lcd1602", "id": "lcd2", "top": -332.57, "left": -377.6, "attrs": {} },
+    { "type": "wokwi-potentiometer", "id": "pot1", "top": 133.1, "left": 431.8, "attrs": {} },
+    {
+      "type": "wokwi-resistor",
+      "id": "r1",
+      "top": -111.25,
+      "left": 0,
+      "attrs": { "value": "1000" }
+    },
+    {
+      "type": "wokwi-hc-sr04",
+      "id": "ultrasonic1",
+      "top": -286.5,
+      "left": 34.3,
+      "attrs": { "distance": "327" }
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btn1",
+      "top": -61,
+      "left": -259.2,
+      "attrs": { "color": "green" }
+    },
+    { "type": "wokwi-slide-switch", "id": "sw1", "top": 33.2, "left": 233.5, "attrs": {} },
+    { "type": "wokwi-ks2e-m-dc5", "id": "relay1", "top": 340.5, "left": 378.5, "attrs": {} },
+    {
+      "type": "wokwi-led",
+      "id": "led2",
+      "top": 130.8,
+      "left": 541.4,
+      "attrs": { "color": "red" }
+    },
+    {
+      "type": "wokwi-resistor",
+      "id": "r3",
+      "top": 407.15,
+      "left": 9.6,
+      "attrs": { "value": "220" }
+    },
+    { "type": "wokwi-dht22", "id": "dht1", "top": -124.5, "left": 685.8, "attrs": {} },
+    {
+      "type": "wokwi-gas-sensor",
+      "id": "gas1",
+      "top": -119.2,
+      "left": 367.7,
+      "rotate": 90,
+      "attrs": {}
+    },
+    { "type": "wokwi-piezo-buzzer", "id": "buzzer1", "top": 150.9, "left": 590, "attrs": {} },
+    {
+      "type": "wokwi-led",
+      "id": "led_pump",
+      "top": 140.4,
+      "left": 647,
+      "attrs": { "color": "blue", "label": "PUMP" }
+    },
+    {
+      "type": "wokwi-resistor",
+      "id": "r2",
+      "top": 407.15,
+      "left": 105.6,
+      "attrs": { "value": "220" }
+    }
+  ],
+  "connections": [
+    [ "esp:TX", "$serialMonitor:RX", "", [] ],
+    [ "esp:RX", "$serialMonitor:TX", "", [] ],
+    [ "lcd2:VSS", "esp:GND.1", "black", [ "v0" ] ],
+    [ "esp:3V3", "lcd2:VDD", "red", [ "h-11.9", "v-115.05", "h-132.2" ] ],
+    [ "pot1:GND", "lcd2:VSS", "black", [ "v-9.6", "h-403.2" ] ],
+    [ "pot1:SIG", "lcd2:V0", "green", [ "v-28.8", "h-393.7" ] ],
+    [ "pot1:VCC", "lcd2:VDD", "red", [ "h-413.6", "v-96", "h-220.9" ] ],
+    [ "lcd2:RW", "lcd2:VSS", "black", [ "v19.2", "h-48.1" ] ],
+    [ "lcd2:A", "r1:1", "green", [ "v0" ] ],
+    [ "r1:2", "lcd2:VDD", "orange", [ "v-28.8", "h-260.4" ] ],
+    [ "lcd2:K", "lcd2:VSS", "white", [ "v28.8", "h-153.6" ] ],
+    [ "ultrasonic1:VCC", "esp:3V3", "red", [ "h-407.9", "v-326.4" ] ],
+    [ "ultrasonic1:GND", "esp:GND.2", "black", [ "v297.6", "h-350.3" ] ],
+    [ "btn1:2.l", "esp:GND.1", "green", [ "h-9.6", "v-19.4" ] ],
+    [ "sw1:2", "esp:GND.1", "cyan", [ "v-38.4", "h176.8" ] ],
+    [ "relay1:COIL1", "esp:GND.1", "white", [ "v-19.2" ] ],
+    [ "esp:3V3", "relay1:P1", "red", [ "h288", "v-86.4" ] ],
+    [ "dht1:GND", "esp:GND.2", "limegreen", [ "v230.4", "h-523.2" ] ],
+    [ "esp:3V3", "dht1:VCC", "red", [ "h470.4", "v-153.6" ] ],
+    [ "dht1:VCC", "gas1:VCC", "red", [ "v-9.6", "h-105.6" ] ],
+    [ "gas1:GND", "dht1:GND", "black", [ "v86.4", "h116" ] ],
+    [ "lcd2:RS", "esp:23", "limegreen", [ "v86.4", "h246.2", "v-230.3" ] ],
+    [ "lcd2:E", "esp:22", "magenta", [ "v19.2", "h216", "v-249.5" ] ],
+    [ "lcd2:D4", "esp:21", "limegreen", [ "v28.8", "h192", "v-278.3" ] ],
+    [ "lcd2:D5", "esp:19", "cyan", [ "v9.6", "h163.2", "v-307.1" ] ],
+    [ "lcd2:D6", "esp:18", "red", [ "v48", "h134.4", "v-326.3" ] ],
+    [ "lcd2:D7", "esp:17", "blue", [ "v38.4", "h105.6", "v-355.1" ] ],
+    [ "dht1:SDA", "esp:16", "green", [ "v115.2", "h-684.7", "v-364.7" ] ],
+    [ "gas1:AOUT", "esp:34", "green", [ "v144", "h-585.5" ] ],
+    [ "ultrasonic1:TRIG", "esp:32", "yellow", [ "v268.8", "h-478.3" ] ],
+    [ "ultrasonic1:ECHO", "esp:33", "magenta", [ "v259.2", "h-497.5" ] ],
+    [ "relay1:COIL2", "esp:25", "limegreen", [ "v-28.8", "h-913.3" ] ],
+    [ "btn1:1.r", "esp:27", "gold", [ "h29", "v239.85" ] ],
+    [ "sw1:1", "esp:26", "white", [ "h-38.4", "v38.5" ] ],
+    [ "led_pump:C", "relay1:COIL1", "black", [ "v38.4", "h-34.1" ] ],
+    [ "r2:2", "led_pump:A", "green", [ "v-19.2", "h23.2" ] ],
+    [ "r2:1", "relay1:NO", "green", [ "v-28.8", "h-115.2" ] ],
+    [ "led2:A", "r3:1", "green", [ "v0" ] ],
+    [ "esp:13", "r3:2", "green", [ "v-28.8", "h-36.21", "v-46.4" ] ],
+    [ "buzzer1:1", "esp:12", "green", [ "h0", "v-86.4", "h-432", "v-95.9" ] ],
+    [ "led2:C", "esp:GND.2", "black", [ "v96", "h-475.2", "v-96" ] ],
+    [ "buzzer1:2", "esp:GND.2", "black", [ "v124.8", "h-523.2", "v-96" ] ]
+  ],
+  "dependencies": {}
+}
